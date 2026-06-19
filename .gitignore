@@ -1,0 +1,16 @@
+# Secrets & local state
+client_secret.json
+token_drive.json
+mux_sync_log.json
+supabase_sync_log.json
+.env
+
+# Python
+.venv/
+.venv-1/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
