@@ -9,7 +9,7 @@ and records the result in a local sync log (supabase_sync_log.json) so
 re-runs are idempotent.
 
 Requirements:
-    pip install google-api-python-client google-auth-httplib2 \
+    pip install python-dotenv google-api-python-client google-auth-httplib2 \
                 google-auth-oauthlib supabase tqdm
 """
 
@@ -20,6 +20,8 @@ import mimetypes
 import tempfile
 from pathlib import Path
 from datetime import datetime
+
+from env_config import require_env
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 from google.oauth2.credentials import Credentials
@@ -33,17 +35,14 @@ from supabase import create_client, Client
 from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION — fill these in before running
+# CONFIGURATION — set values in .env (copy from .env.example)
 # ─────────────────────────────────────────────────────────────────────────────
 
-SUPABASE_URL         = "https://YOUR_PROJECT.supabase.co"
-SUPABASE_SERVICE_KEY = "your_service_role_key"   # Settings → API → service_role key
+SUPABASE_URL         = require_env("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = require_env("SUPABASE_SERVICE_KEY")
+SUPABASE_BUCKET      = os.getenv("SUPABASE_BUCKET", "resources-public")
 
-# Supabase Storage bucket name (create it in the dashboard first)
-SUPABASE_BUCKET = "resources-public"
-
-# Path to your Google OAuth client_secret JSON downloaded from Google Cloud Console
-GOOGLE_OAUTH_CLIENT_FILE = "client_secret.json"
+GOOGLE_OAUTH_CLIENT_FILE = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "client_secret.json")
 
 # Local file that tracks what has already been uploaded (auto-created)
 SYNC_LOG_FILE = "supabase_sync_log.json"
@@ -253,9 +252,8 @@ def upload_to_supabase(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Validate credentials ──────────────────────────────────────────────────
-    if "YOUR_PROJECT" in SUPABASE_URL:
-        print("\n✗ Please fill in SUPABASE_URL and SUPABASE_SERVICE_KEY at the top of this script.")
+    if "YOUR_PROJECT" in SUPABASE_URL or SUPABASE_SERVICE_KEY == "your_service_role_key":
+        print("\n✗ Please set SUPABASE_URL and SUPABASE_SERVICE_KEY in your .env file.")
         exit(1)
 
     # ── Connect to Supabase ───────────────────────────────────────────────────

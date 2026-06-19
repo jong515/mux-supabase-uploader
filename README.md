@@ -20,9 +20,16 @@ Each script keeps a local sync log so re-runs never double-upload the same file.
 
 ### 1. Install dependencies
 
-```bash
-pip install google-api-python-client google-auth-httplib2 
+Use a virtual environment if you don't already have one:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install python-dotenv google-api-python-client google-auth-httplib2 `
+            google-auth-oauthlib mux-python supabase requests tqdm
 ```
+
+Requires **mux-python 5.x** (tested with 5.1.2).
 
 ### 2. Google OAuth credentials
 
@@ -38,19 +45,34 @@ After that a `token_drive.json` is saved locally so you won't be asked again.
 
 ### 3. Fill in credentials
 
-**`upload_to_mux.py`** — top of file:
-```python
-MUX_TOKEN_ID     = "your_token_id"
-MUX_TOKEN_SECRET = "your_token_secret"
-```
-Get these from: [Mux Dashboard](https://dashboard.mux.com) → Settings → API Keys
+Copy the example env file and add your keys:
 
-**`upload_to_supabase.py`** — top of file:
-```python
-SUPABASE_URL         = "https://YOUR_PROJECT.supabase.co"
-SUPABASE_SERVICE_KEY = "your_service_role_key"
+```powershell
+Copy-Item .env.example .env
 ```
-Get these from: Supabase Dashboard → Settings → API → `service_role` key (not `anon`)
+
+Edit `.env`:
+
+| Variable | Used by | Where to get it |
+|---|---|---|
+| `MUX_TOKEN_ID` | `upload_to_mux.py` | [Mux Dashboard](https://dashboard.mux.com) → Settings → API Keys |
+| `MUX_TOKEN_SECRET` | `upload_to_mux.py` | Same as above |
+| `SUPABASE_URL` | `upload_to_supabase.py` | Supabase Dashboard → Settings → API |
+| `SUPABASE_SERVICE_KEY` | `upload_to_supabase.py` | `service_role` key (not `anon`) |
+| `SUPABASE_BUCKET` | `upload_to_supabase.py` | Storage bucket name (default: `resources-public`) |
+| `GOOGLE_OAUTH_CLIENT_FILE` | Both scripts | Path to OAuth JSON (default: `client_secret.json`) |
+
+Credentials are loaded by `env_config.py` from `.env` at startup. Never commit `.env` — only `.env.example` is tracked in git.
+
+### 4. Local files (not in git)
+
+| File | Purpose |
+|---|---|
+| `.env` | API keys and secrets |
+| `client_secret.json` | Google OAuth client (from Cloud Console) |
+| `token_drive.json` | Saved Google sign-in (created on first run) |
+| `mux_sync_log.json` | Tracks uploaded videos |
+| `supabase_sync_log.json` | Tracks uploaded PDFs/images |
 
 ---
 
@@ -81,6 +103,16 @@ Both scripts will:
 3. Ask for confirmation before uploading anything
 4. Print a summary with IDs/URLs to paste into Supabase
 
+### Mux playback access
+
+By default, `upload_to_mux.py` uploads videos as **public** — anyone with the playback URL can stream them. This is controlled by `PLAYBACK_POLICY` at the top of `upload_to_mux.py`:
+
+```python
+PLAYBACK_POLICY = "public"   # or "signed" for JWT-protected playback
+```
+
+Only affects **new** uploads. Existing Mux assets keep the policy they were created with.
+
 ---
 
 ## Sync Logs
@@ -95,6 +127,13 @@ Keep these files. They prevent re-uploading the same file on future runs.
 ---
 
 ## After Uploading
+
+**Videos (Mux)** — the script prints `asset_id` and `playback_id` for each file. Insert them into your videos table, for example:
+
+```sql
+INSERT INTO videos (mux_asset_id, mux_playback_id, title, entity)
+VALUES ('abc123...', 'xyz789...', 'Introduction to DSA', 'dsa');
+```
 
 **PDFs / Images (Supabase Storage)** — the script prints the public URL. Insert it:
 ```sql

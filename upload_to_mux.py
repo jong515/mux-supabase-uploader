@@ -8,7 +8,7 @@ then uploads each one to Mux and records the result in a local
 sync log (mux_sync_log.json) so re-runs are idempotent.
 
 Requirements:
-    pip install google-api-python-client google-auth-httplib2 \
+    pip install python-dotenv google-api-python-client google-auth-httplib2 \
                 google-auth-oauthlib mux-python requests tqdm
 """
 
@@ -19,6 +19,8 @@ import tempfile
 import requests
 from pathlib import Path
 from datetime import datetime
+
+from env_config import require_env
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 from google.oauth2.credentials import Credentials
@@ -33,15 +35,13 @@ from mux_python.rest import ApiException
 from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION — fill these in before running
+# CONFIGURATION — set values in .env (copy from .env.example)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MUX_TOKEN_ID     = "your_token_id"       # From Mux dashboard → Settings → API keys
-MUX_TOKEN_SECRET = "your_token_secret"
+MUX_TOKEN_ID     = require_env("MUX_TOKEN_ID")
+MUX_TOKEN_SECRET = require_env("MUX_TOKEN_SECRET")
 
-# Path to your Google OAuth client_secret JSON downloaded from Google Cloud Console
-# https://console.cloud.google.com → APIs & Services → Credentials → OAuth 2.0 Client
-GOOGLE_OAUTH_CLIENT_FILE = "client_secret.json"
+GOOGLE_OAUTH_CLIENT_FILE = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "client_secret.json")
 
 # Local file that tracks what has already been uploaded (auto-created)
 SYNC_LOG_FILE = "mux_sync_log.json"
@@ -207,10 +207,9 @@ def upload_to_mux(tmp_path: str, filename: str) -> dict:
     # Step 1: Create a direct upload URL
     create_req = mux_python.CreateUploadRequest(
         new_asset_settings=mux_python.CreateAssetRequest(
-            playback_policy=[mux_python.PlaybackPolicy(PLAYBACK_POLICY)],
-            meta=mux_python.AssetNonStandardInputParams(title=Path(filename).stem),
+            playback_policies=[PLAYBACK_POLICY],
+            meta=mux_python.AssetMetadata(title=Path(filename).stem),
         ),
-        cors_origin="*",
         timeout=3600,
     )
     upload = uploads_api.create_direct_upload(create_req)
@@ -259,9 +258,8 @@ def upload_to_mux(tmp_path: str, filename: str) -> dict:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Validate credentials are set ──────────────────────────────────────────
-    if MUX_TOKEN_ID == "YOUR_MUX_TOKEN_ID":
-        print("\n✗ Please fill in MUX_TOKEN_ID and MUX_TOKEN_SECRET at the top of this script.")
+    if MUX_TOKEN_ID == "your_token_id" or MUX_TOKEN_SECRET == "your_token_secret":
+        print("\n✗ Please set MUX_TOKEN_ID and MUX_TOKEN_SECRET in your .env file.")
         exit(1)
 
     # ── Connect to Drive ──────────────────────────────────────────────────────
