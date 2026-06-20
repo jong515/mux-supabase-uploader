@@ -1,68 +1,307 @@
 """
-TTG Consulting Portal — Google Drive → Supabase Storage Uploader
-----------------------------------------------------------------
-Run: python upload_to_supabase.py
+TTG Consulting Portal — Google Drive → Supabase Storage + resources table
+---------------------------------------------------------------------------
+Run (Drive mode):
+    python upload_to_supabase.py
 
-Prompts you to pick a Drive folder and a Supabase storage bucket path,
-previews all PDFs and images found, then uploads each one to Supabase Storage
-and records the result in a local sync log (supabase_sync_log.json) so
-re-runs are idempotent.
+Run (local manifest batch):
+    python upload_to_supabase.py --manifest course_pdfs.json
+
+Drive mode: pick a Drive folder, upload PDFs/images to Supabase Storage.
+Course PDFs are registered in the `resources` table for the portal dashboard.
+Images upload to Storage only (no resources row).
 
 Requirements:
     pip install python-dotenv google-api-python-client google-auth-httplib2 \
                 google-auth-oauthlib supabase tqdm
 """
 
-import os
+import argparse
 import io
 import json
 import mimetypes
-import tempfile
-from pathlib import Path
+import os
+import re
 from datetime import datetime
+from pathlib import Path
 
 from env_config import require_env
-
-# ── Google Drive ──────────────────────────────────────────────────────────────
+from cli_prompts import prompt_input
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
-# ── Supabase ──────────────────────────────────────────────────────────────────
-from supabase import create_client, Client
+from supabase import Client, create_client
 from tqdm import tqdm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — set values in .env (copy from .env.example)
 # ─────────────────────────────────────────────────────────────────────────────
 
-SUPABASE_URL         = require_env("SUPABASE_URL")
+SUPABASE_URL = require_env("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = require_env("SUPABASE_SERVICE_KEY")
-SUPABASE_BUCKET      = os.getenv("SUPABASE_BUCKET", "resources-public")
-
+# Legacy default for image uploads in Drive mode (optional override)
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "resources-public")
 GOOGLE_OAUTH_CLIENT_FILE = os.getenv("GOOGLE_OAUTH_CLIENT_FILE", "client_secret.json")
 
-# Local file that tracks what has already been uploaded (auto-created)
 SYNC_LOG_FILE = "supabase_sync_log.json"
+DRIVE_MANIFEST_FILE = "pdfs_manifest.json"
 
-# File types to pick up
-PDF_EXTENSIONS   = {".pdf"}
+PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"}
-ALL_EXTENSIONS   = PDF_EXTENSIONS | IMAGE_EXTENSIONS
+ALL_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
-# Whether to make uploaded files publicly accessible
-# True  = public URL (good for marketing images, downloadable PDFs)
-# False = private, access via signed URLs (good for paid resources)
+ALLOWED_TOPICS = {"dsa-pathways", "timelines-deadlines", "interview-preparation"}
+
+COURSE_1 = {
+    "bucket": "resources-public",
+    "path_prefix": "course-1/pdf/",
+    "is_paid": False,
+    "category": "course-1",
+    "topics": {"dsa-pathways", "timelines-deadlines"},
+}
+
+COURSE_2 = {
+    "bucket": "resources-paid",
+    "path_prefix": "course-2/pdf/",
+    "is_paid": True,
+    "category": "course-2",
+    "topics": {"interview-preparation"},
+}
+
+COURSES = {"1": COURSE_1, "2": COURSE_2}
+
+# Whether image uploads use public URLs in sync log (images only; PDFs use bucket+file_path)
 PUBLIC_UPLOAD = True
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Validation & resources core ─────────────────────────────────────────────
+
+
+def _course_for_definition(defn: dict) -> dict | None:
+    bucket = defn.get("bucket")
+    file_path = defn.get("file_path", "")
+    is_paid = defn.get("is_paid")
+
+    if bucket == COURSE_1["bucket"] and file_path.startswith(COURSE_1["path_prefix"]):
+        if is_paid is False or is_paid == False:  # noqa: E712
+            return COURSE_1
+    if bucket == COURSE_2["bucket"] and file_path.startswith(COURSE_2["path_prefix"]):
+        if is_paid is True or is_paid == True:  # noqa: E712
+            return COURSE_2
+    return None
+
+
+def validate_pdf_definition(defn: dict) -> None:
+    required = {"bucket", "file_path", "title", "topic", "is_paid"}
+    missing = required - defn.keys()
+    if missing:
+        raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
+
+    topic = defn["topic"]
+    if topic not in ALLOWED_TOPICS:
+        raise ValueError(
+            f"topic must be one of {sorted(ALLOWED_TOPICS)}, got {topic!r}"
+        )
+
+    file_path = defn["file_path"]
+    if file_path.startswith("/"):
+        raise ValueError("file_path must not have a leading slash")
+    if not file_path.lower().endswith(".pdf"):
+        raise ValueError(f"file_path must end with .pdf, got {file_path!r}")
+
+    course = _course_for_definition(defn)
+    if course is None:
+        raise ValueError(
+            "bucket/file_path/is_paid must match Course 1 "
+            "(resources-public, course-1/pdf/, is_paid=false) or Course 2 "
+            "(resources-paid, course-2/pdf/, is_paid=true)"
+        )
+
+    if topic not in course["topics"]:
+        raise ValueError(
+            f"topic {topic!r} is not valid for {course['category']} "
+            f"(allowed: {sorted(course['topics'])})"
+        )
+
+
+def build_resource_row(defn: dict) -> dict:
+    row = {
+        "title": defn["title"],
+        "type": "pdf",
+        "topic": defn["topic"],
+        "bucket": defn["bucket"],
+        "file_path": defn["file_path"],
+        "is_paid": defn["is_paid"],
+    }
+    for key in ("description", "sort_order", "duration", "category"):
+        if key in defn and defn[key] is not None:
+            row[key] = defn[key]
+    return row
+
+
+def upload_pdf_bytes(sb: Client, bucket: str, file_path: str, file_bytes: bytes) -> None:
+    sb.storage.from_(bucket).upload(
+        path=file_path,
+        file=file_bytes,
+        file_options={
+            "content-type": "application/pdf",
+            "upsert": "true",
+        },
+    )
+
+
+def upsert_resource_row(sb: Client, row: dict) -> str:
+    try:
+        result = (
+            sb.table("resources")
+            .upsert(row, on_conflict="bucket,file_path")
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["id"]
+    except Exception:
+        pass
+
+    existing = (
+        sb.table("resources")
+        .select("id")
+        .eq("bucket", row["bucket"])
+        .eq("file_path", row["file_path"])
+        .execute()
+    )
+    if existing.data:
+        resource_id = existing.data[0]["id"]
+        sb.table("resources").update(row).eq("id", resource_id).execute()
+        return resource_id
+
+    result = sb.table("resources").insert(row).execute()
+    return result.data[0]["id"]
+
+
+def process_pdf(sb: Client, file_bytes: bytes, definition: dict) -> dict:
+    validate_pdf_definition(definition)
+    upload_pdf_bytes(sb, definition["bucket"], definition["file_path"], file_bytes)
+    resource_id = upsert_resource_row(sb, build_resource_row(definition))
+    return {
+        "status": "ok",
+        "bucket": definition["bucket"],
+        "file_path": definition["file_path"],
+        "resource_id": resource_id,
+        "title": definition["title"],
+    }
+
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+
+class RunStats:
+    def __init__(self):
+        self.uploaded = 0
+        self.registered = 0
+        self.skipped = 0
+        self.errors = 0
+        self.log_lines: list[str] = []
+
+    def record_ok(self, label: str, bucket: str, file_path: str, resource_id: str):
+        self.uploaded += 1
+        self.registered += 1
+        self.log_lines.append(
+            f"  ✓ {label} → {bucket}/{file_path} (id: {resource_id})"
+        )
+
+    def record_image_ok(self, label: str, bucket: str, dest_path: str):
+        self.uploaded += 1
+        self.log_lines.append(f"  ✓ {label} → {bucket}/{dest_path} (image, no resources row)")
+
+    def record_skipped(self, label: str, reason: str):
+        self.skipped += 1
+        self.log_lines.append(f"  ⊘ {label} — {reason}")
+
+    def record_error(self, label: str, reason: str):
+        self.errors += 1
+        self.log_lines.append(f"  ✗ {label} — {reason}")
+
+    def print_summary(self):
+        print("─────────────────────────────────────────")
+        print("Done.")
+        print(f"  Uploaded:   {self.uploaded}")
+        print(f"  Registered: {self.registered}")
+        print(f"  Skipped:    {self.skipped}")
+        print(f"  Errors:     {self.errors}")
+        if self.log_lines:
+            print("\nPer-file log:")
+            for line in self.log_lines:
+                print(line)
+        print()
+
+
+# ── Manifest mode ─────────────────────────────────────────────────────────────
+
+
+def load_manifest(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError("Manifest must be a JSON array of PDF definitions")
+    return data
+
+
+def validate_manifest_all(entries: list[dict]) -> None:
+    for i, entry in enumerate(entries, 1):
+        try:
+            validate_pdf_definition(entry)
+        except ValueError as e:
+            raise ValueError(f"Manifest entry {i}: {e}") from e
+        local_path = entry.get("local_path")
+        if not local_path:
+            raise ValueError(f"Manifest entry {i}: missing local_path")
+        if not Path(local_path).exists():
+            raise ValueError(f"Manifest entry {i}: file not found: {local_path}")
+
+
+def run_manifest_mode(sb: Client, manifest_path: str) -> None:
+    print(f"\nLoading manifest: {manifest_path}")
+    entries = load_manifest(manifest_path)
+    if not entries:
+        print("  Manifest is empty.")
+        return
+
+    validate_manifest_all(entries)
+    print(f"  ✓ {len(entries)} entries validated")
+
+    confirm = input(f"\nUpload {len(entries)} PDF(s) from manifest? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("  Cancelled.")
+        return
+
+    stats = RunStats()
+    print()
+    for i, entry in enumerate(entries, 1):
+        label = Path(entry["local_path"]).name
+        print(f"[{i}/{len(entries)}] {label}")
+        try:
+            file_bytes = Path(entry["local_path"]).read_bytes()
+            result = process_pdf(sb, file_bytes, entry)
+            stats.record_ok(
+                label, result["bucket"], result["file_path"], result["resource_id"]
+            )
+            print(f"  ✓ registered (id: {result['resource_id']})\n")
+        except ValueError as e:
+            stats.record_skipped(label, str(e))
+            print(f"  ⊘ Skipped: {e}\n")
+        except Exception as e:
+            stats.record_error(label, str(e))
+            print(f"  ✗ Failed: {e}\n")
+
+    stats.print_summary()
+
+
+# ── Drive helpers ─────────────────────────────────────────────────────────────
+
 
 def load_sync_log() -> dict:
     if Path(SYNC_LOG_FILE).exists():
@@ -74,11 +313,9 @@ def load_sync_log() -> dict:
 def save_sync_log(log: dict):
     with open(SYNC_LOG_FILE, "w") as f:
         json.dump(log, f, indent=2)
-    print(f"  ✓ Sync log saved → {SYNC_LOG_FILE}")
 
 
 def get_drive_service():
-    """Authenticate with Google Drive via OAuth (browser popup on first run)."""
     creds = None
     token_file = "token_drive.json"
 
@@ -92,9 +329,10 @@ def get_drive_service():
             if not Path(GOOGLE_OAUTH_CLIENT_FILE).exists():
                 print(f"\n✗ Missing OAuth file: {GOOGLE_OAUTH_CLIENT_FILE}")
                 print("  Download it from: https://console.cloud.google.com")
-                print("  APIs & Services → Credentials → OAuth 2.0 Client IDs → Download JSON")
                 exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(GOOGLE_OAUTH_CLIENT_FILE, SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(
+                GOOGLE_OAUTH_CLIENT_FILE, SCOPES
+            )
             creds = flow.run_local_server(port=0)
         with open(token_file, "w") as f:
             f.write(creds.to_json())
@@ -103,109 +341,182 @@ def get_drive_service():
 
 
 def list_folder_contents(service, folder_id: str) -> list[dict]:
-    """List all files in a Drive folder (non-recursive)."""
     results = []
     page_token = None
-
     while True:
         resp = service.files().list(
             q=f"'{folder_id}' in parents and trashed=false",
             fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
             pageToken=page_token,
         ).execute()
-
         results.extend(resp.get("files", []))
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-
     return results
 
 
 def list_subfolders(service, folder_id: str) -> list[dict]:
-    """List immediate subfolders of a Drive folder."""
     resp = service.files().list(
-        q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        q=(
+            f"'{folder_id}' in parents and "
+            "mimeType='application/vnd.google-apps.folder' and trashed=false"
+        ),
         fields="files(id, name)",
     ).execute()
     return resp.get("files", [])
 
 
-def pick_folder(service) -> tuple[str, str]:
-    """
-    Interactively lets you paste a folder ID or pick from a root folder's subfolders.
-    Returns (folder_id, folder_name).
-    """
+def resolve_folder_id(service, folder_id: str) -> tuple[str, str]:
+    folder_id = folder_id.strip()
+    meta = service.files().get(fileId=folder_id, fields="name").execute()
+    return folder_id, meta.get("name", folder_id)
+
+
+def pick_folder(service, folder_id: str | None = None) -> tuple[str, str]:
+    if folder_id:
+        return resolve_folder_id(service, folder_id)
+
     print("\n─────────────────────────────────────────")
     print("  TTG → Supabase Storage Uploader")
     print("─────────────────────────────────────────")
     print("\nHow would you like to specify the Drive folder?")
     print("  1. Paste a folder ID directly")
     print("  2. Browse subfolders of a root folder")
-    choice = input("\nChoice (1/2): ").strip()
+    print("  Or run with: --folder-id YOUR_FOLDER_ID")
+    choice = prompt_input("\nChoice (1/2): ", show_paste_hint=False)
 
     if choice == "1":
-        folder_id = input("Paste Drive folder ID: ").strip()
-        meta = service.files().get(fileId=folder_id, fields="name").execute()
-        return folder_id, meta.get("name", folder_id)
+        folder_id = prompt_input("Drive folder ID: ")
+        return resolve_folder_id(service, folder_id)
 
-    elif choice == "2":
-        root_id = input("Paste root Drive folder ID: ").strip()
+    if choice == "2":
+        root_id = prompt_input("Root Drive folder ID: ")
         subfolders = list_subfolders(service, root_id)
-
         if not subfolders:
-            print("  No subfolders found. Uploading from root folder directly.")
-            meta = service.files().get(fileId=root_id, fields="name").execute()
-            return root_id, meta.get("name", root_id)
-
+            return resolve_folder_id(service, root_id)
         print("\nSubfolders found:")
         for i, f in enumerate(subfolders, 1):
             print(f"  {i}. {f['name']}  ({f['id']})")
-        print(f"  {len(subfolders)+1}. Use root folder itself")
-
-        idx = int(input("\nSelect folder number: ").strip()) - 1
+        print(f"  {len(subfolders) + 1}. Use root folder itself")
+        idx = int(prompt_input("\nSelect folder number: ", show_paste_hint=False)) - 1
         if idx == len(subfolders):
-            meta = service.files().get(fileId=root_id, fields="name").execute()
-            return root_id, meta.get("name", root_id)
+            return resolve_folder_id(service, root_id)
         chosen = subfolders[idx]
         return chosen["id"], chosen["name"]
 
-    else:
-        print("Invalid choice.")
+    print("Invalid choice.")
+    exit(1)
+
+
+def pick_course(course_arg: str | None = None) -> dict:
+    if course_arg:
+        if course_arg not in COURSES:
+            print(f"\n✗ Invalid --course {course_arg!r}. Use 1 or 2.")
+            exit(1)
+        return COURSES[course_arg]
+
+    print("\nWhich course are these PDFs for?")
+    print("  1. Course 1 (free) — bucket: resources-public, path: course-1/pdf/")
+    print("  2. Course 2 (paid) — bucket: resources-paid, path: course-2/pdf/")
+    choice = prompt_input("\nCourse (1/2): ", show_paste_hint=False)
+    if choice not in COURSES:
+        print("Invalid course.")
         exit(1)
+    return COURSES[choice]
 
 
-def pick_storage_path(folder_name: str) -> str:
-    """
-    Let user define where in the Supabase bucket to put the files.
-    Suggests a default based on the Drive folder name.
-    """
-    default = folder_name.lower().replace(" ", "-")
-    print(f"\nWhere in the '{SUPABASE_BUCKET}' bucket should files be stored?")
-    print(f"  Default: {default}/")
-    print("  Examples: dsa/pdfs/  |  maplebear/images/  |  resources/2025/")
-    path = input(f"\nStorage path (press Enter for '{default}/'): ").strip()
-    if not path:
-        path = default
-    # Normalise: strip leading/trailing slashes
-    path = path.strip("/")
-    return path
+def pick_topic(course: dict, topic_arg: str | None = None) -> str:
+    if topic_arg:
+        if topic_arg not in course["topics"]:
+            print(
+                f"\n✗ topic {topic_arg!r} is not valid for {course['category']}. "
+                f"Allowed: {sorted(course['topics'])}"
+            )
+            exit(1)
+        return topic_arg
+
+    topics = sorted(course["topics"])
+    print(f"\nTopic for {course['category']} PDFs:")
+    for i, t in enumerate(topics, 1):
+        print(f"  {i}. {t}")
+    idx = int(prompt_input("\nSelect topic number: ", show_paste_hint=False)) - 1
+    if idx < 0 or idx >= len(topics):
+        print("Invalid topic.")
+        exit(1)
+    return topics[idx]
+
+
+def load_drive_manifest() -> dict[str, dict]:
+    """Optional companion manifest keyed by Drive filename."""
+    path = Path(DRIVE_MANIFEST_FILE)
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return {entry["filename"]: entry for entry in data if "filename" in entry}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip().replace(" ", "-")
+    name = re.sub(r"[^\w.\-]", "", name, flags=re.ASCII)
+    return name.lower()
+
+
+def humanize_title(filename: str) -> str:
+    stem = Path(filename).stem
+    stem = stem.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", stem).strip()
+
+
+def build_drive_pdf_definition(
+    drive_file: dict,
+    course: dict,
+    topic: str,
+    sort_order: int,
+    manifest_entry: dict | None,
+) -> dict:
+    filename = sanitize_filename(drive_file["name"])
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf" if not filename.endswith(".") else f"{filename}pdf"
+
+    if manifest_entry and manifest_entry.get("file_path"):
+        file_path = manifest_entry["file_path"].lstrip("/")
+    else:
+        file_path = f"{course['path_prefix']}{filename}"
+
+    defn = {
+        "bucket": course["bucket"],
+        "file_path": file_path,
+        "title": manifest_entry.get("title") if manifest_entry else humanize_title(drive_file["name"]),
+        "topic": manifest_entry.get("topic", topic) if manifest_entry else topic,
+        "is_paid": course["is_paid"],
+        "category": course["category"],
+        "sort_order": manifest_entry.get("sort_order", sort_order) if manifest_entry else sort_order,
+    }
+    if manifest_entry:
+        for key in ("description", "duration"):
+            if key in manifest_entry and manifest_entry[key] is not None:
+                defn[key] = manifest_entry[key]
+    return defn
 
 
 def filter_by_type(files: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split files into (pdfs, images), ignoring other types."""
-    pdfs   = [f for f in files if Path(f["name"]).suffix.lower() in PDF_EXTENSIONS]
+    pdfs = [f for f in files if Path(f["name"]).suffix.lower() in PDF_EXTENSIONS]
     images = [f for f in files if Path(f["name"]).suffix.lower() in IMAGE_EXTENSIONS]
     return pdfs, images
 
 
 def download_to_bytes(service, file_id: str, filename: str) -> bytes:
-    """Download a Drive file and return its bytes."""
     request = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request, chunksize=5 * 1024 * 1024)
     done = False
-    with tqdm(total=100, desc=f"  Downloading", unit="%", leave=False) as bar:
+    with tqdm(total=100, desc="  Downloading", unit="%", leave=False) as bar:
         last = 0
         while not done:
             status, done = downloader.next_chunk()
@@ -216,153 +527,217 @@ def download_to_bytes(service, file_id: str, filename: str) -> bytes:
     return buf.getvalue()
 
 
-def upload_to_supabase(
+def upload_image_bytes(
     sb: Client,
     file_bytes: bytes,
+    bucket: str,
     storage_path: str,
     filename: str,
 ) -> str:
-    """
-    Upload bytes to Supabase Storage.
-    Returns the public URL (or storage path if private).
-    """
     content_type, _ = mimetypes.guess_type(filename)
     if not content_type:
         content_type = "application/octet-stream"
-
     dest_path = f"{storage_path}/{filename}"
-
-    # upsert=True overwrites if file already exists
-    sb.storage.from_(SUPABASE_BUCKET).upload(
+    sb.storage.from_(bucket).upload(
         path=dest_path,
         file=file_bytes,
-        file_options={
-            "content-type": content_type,
-            "upsert": "true",
-        },
+        file_options={"content-type": content_type, "upsert": "true"},
     )
-
     if PUBLIC_UPLOAD:
-        result = sb.storage.from_(SUPABASE_BUCKET).get_public_url(dest_path)
-        return result
-    else:
-        return dest_path
+        return sb.storage.from_(bucket).get_public_url(dest_path)
+    return dest_path
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def pick_image_storage_path(folder_name: str) -> str:
+    default = folder_name.lower().replace(" ", "-")
+    print(f"\nWhere in '{SUPABASE_BUCKET}' should images be stored?")
+    path = prompt_input(f"Storage path (Enter for '{default}/'): ", show_paste_hint=False)
+    return (path or default).strip("/")
 
-def main():
-    if "YOUR_PROJECT" in SUPABASE_URL or SUPABASE_SERVICE_KEY == "your_service_role_key":
-        print("\n✗ Please set SUPABASE_URL and SUPABASE_SERVICE_KEY in your .env file.")
-        exit(1)
 
-    # ── Connect to Supabase ───────────────────────────────────────────────────
-    print("\nConnecting to Supabase...")
-    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    print("  ✓ Supabase connected")
-
-    # ── Connect to Drive ──────────────────────────────────────────────────────
+def run_drive_mode(
+    sb: Client,
+    *,
+    folder_id: str | None = None,
+    course_arg: str | None = None,
+    topic_arg: str | None = None,
+    auto_confirm: bool = False,
+) -> None:
     print("Connecting to Google Drive...")
     service = get_drive_service()
     print("  ✓ Drive authenticated")
 
-    # ── Pick folder ───────────────────────────────────────────────────────────
-    folder_id, folder_name = pick_folder(service)
+    folder_id, folder_name = pick_folder(service, folder_id=folder_id)
     print(f"\n  Folder: {folder_name} ({folder_id})")
 
-    # ── List files ────────────────────────────────────────────────────────────
     all_files = list_folder_contents(service, folder_id)
     pdfs, images = filter_by_type(all_files)
-    target_files = pdfs + images
 
-    if not target_files:
+    if not pdfs and not images:
         print("\n  No PDF or image files found in this folder.")
-        print(f"  Supported types: {', '.join(sorted(ALL_EXTENSIONS))}")
         return
 
-    # ── Pick storage path ─────────────────────────────────────────────────────
-    storage_path = pick_storage_path(folder_name)
-    print(f"\n  Will upload to: {SUPABASE_BUCKET}/{storage_path}/")
+    course = None
+    topic = None
+    drive_manifest = load_drive_manifest()
+    if drive_manifest:
+        print(f"\n  ✓ Loaded companion manifest: {DRIVE_MANIFEST_FILE}")
 
-    # ── Load sync log ─────────────────────────────────────────────────────────
-    sync_log = load_sync_log()
-    new_files = [f for f in target_files if f["id"] not in sync_log]
-    already_synced = len(target_files) - len(new_files)
+    image_storage_path = None
+    if pdfs:
+        course = pick_course(course_arg)
+        topic = pick_topic(course, topic_arg)
+        print(f"\n  PDFs → {course['bucket']}/{course['path_prefix']}*")
+        print(f"  Topic: {topic}  |  Portal registration: yes")
 
-    # ── Preview ───────────────────────────────────────────────────────────────
-    new_pdfs   = [f for f in new_files if Path(f["name"]).suffix.lower() in PDF_EXTENSIONS]
-    new_images = [f for f in new_files if Path(f["name"]).suffix.lower() in IMAGE_EXTENSIONS]
+    if images:
+        image_storage_path = pick_image_storage_path(folder_name)
+        print(f"\n  Images → {SUPABASE_BUCKET}/{image_storage_path}/")
+        print("  Portal registration: no (images only)")
 
-    print(f"\n  Found {len(target_files)} file(s) — "
-          f"{already_synced} already synced, {len(new_files)} new")
-    print(f"    PDFs:   {len(new_pdfs)}")
-    print(f"    Images: {len(new_images)}\n")
+    target_files = pdfs + images
+    print(f"\n  Found {len(pdfs)} PDF(s), {len(images)} image(s)")
 
-    if not new_files:
-        print("  Nothing to upload. All files already synced.")
-        return
-
-    print("  Files to upload:")
-    for i, f in enumerate(new_files, 1):
-        ext  = Path(f["name"]).suffix.lower()
+    print("\n  Files to process:")
+    for i, f in enumerate(target_files, 1):
+        ext = Path(f["name"]).suffix.lower()
         kind = "PDF" if ext in PDF_EXTENSIONS else "IMG"
         size_kb = int(f.get("size", 0)) / 1000
         print(f"    {i}. [{kind}] {f['name']}  ({size_kb:.0f} KB)")
 
-    confirm = input(f"\nUpload {len(new_files)} file(s) to Supabase? (y/n): ").strip().lower()
+    if auto_confirm:
+        confirm = "y"
+    else:
+        confirm = prompt_input(
+            f"\nUpload {len(target_files)} file(s)? (y/n): ", show_paste_hint=False
+        ).lower()
     if confirm != "y":
         print("  Cancelled.")
         return
 
-    # ── Upload loop ───────────────────────────────────────────────────────────
+    sync_log = load_sync_log()
+    stats = RunStats()
+    pdf_index = 0
+
     print()
-    results = []
-    for i, file in enumerate(new_files, 1):
-        ext  = Path(file["name"]).suffix.lower()
-        kind = "PDF" if ext in PDF_EXTENSIONS else "IMG"
-        print(f"[{i}/{len(new_files)}] [{kind}] {file['name']}")
+    for i, file in enumerate(target_files, 1):
+        ext = Path(file["name"]).suffix.lower()
+        is_pdf = ext in PDF_EXTENSIONS
+        kind = "PDF" if is_pdf else "IMG"
+        print(f"[{i}/{len(target_files)}] [{kind}] {file['name']}")
+
         try:
             file_bytes = download_to_bytes(service, file["id"], file["name"])
-            url = upload_to_supabase(sb, file_bytes, storage_path, file["name"])
 
-            sync_log[file["id"]] = {
-                "filename":          file["name"],
-                "synced_at":         datetime.utcnow().isoformat(),
-                "supabase_url":      url,
-                "storage_path":      f"{storage_path}/{file['name']}",
-                "bucket":            SUPABASE_BUCKET,
-                "drive_folder_id":   folder_id,
-                "drive_folder_name": folder_name,
-            }
-            save_sync_log(sync_log)
+            if is_pdf:
+                pdf_index += 1
+                manifest_entry = drive_manifest.get(file["name"])
+                defn = build_drive_pdf_definition(
+                    file, course, topic, pdf_index, manifest_entry
+                )
+                try:
+                    validate_pdf_definition(defn)
+                except ValueError as e:
+                    stats.record_skipped(file["name"], str(e))
+                    print(f"  ⊘ Skipped: {e}\n")
+                    continue
 
-            results.append({**file, "url": url, "status": "ok"})
-            short_url = url if len(url) < 80 else url[:77] + "..."
-            print(f"  ✓ {short_url}\n")
+                result = process_pdf(sb, file_bytes, defn)
+                sync_log[file["id"]] = {
+                    "filename": file["name"],
+                    "synced_at": datetime.utcnow().isoformat(),
+                    "bucket": result["bucket"],
+                    "file_path": result["file_path"],
+                    "resource_id": result["resource_id"],
+                    "drive_folder_id": folder_id,
+                    "drive_folder_name": folder_name,
+                }
+                save_sync_log(sync_log)
+                stats.record_ok(
+                    file["name"],
+                    result["bucket"],
+                    result["file_path"],
+                    result["resource_id"],
+                )
+                print(f"  ✓ registered (id: {result['resource_id']})\n")
+
+            else:
+                dest_path = f"{image_storage_path}/{file['name']}"
+                url = upload_image_bytes(
+                    sb, file_bytes, SUPABASE_BUCKET, image_storage_path, file["name"]
+                )
+                sync_log[file["id"]] = {
+                    "filename": file["name"],
+                    "synced_at": datetime.utcnow().isoformat(),
+                    "supabase_url": url,
+                    "storage_path": dest_path,
+                    "bucket": SUPABASE_BUCKET,
+                    "drive_folder_id": folder_id,
+                    "drive_folder_name": folder_name,
+                }
+                save_sync_log(sync_log)
+                stats.record_image_ok(file["name"], SUPABASE_BUCKET, dest_path)
+                print(f"  ✓ uploaded (no resources row)\n")
 
         except Exception as e:
+            stats.record_error(file["name"], str(e))
             print(f"  ✗ Failed: {e}\n")
-            results.append({**file, "status": "error", "error": str(e)})
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    ok  = [r for r in results if r["status"] == "ok"]
-    err = [r for r in results if r["status"] == "error"]
+    stats.print_summary()
 
-    print("─────────────────────────────────────────")
-    print(f"  Done. {len(ok)} uploaded, {len(err)} failed.")
 
-    if ok:
-        print("\n  Paste these into Supabase (resources table):")
-        print(f"  {'Filename':<45} URL")
-        print(f"  {'-'*45} {'-'*50}")
-        for r in ok:
-            print(f"  {r['name']:<45} {r['url']}")
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-    if err:
-        print("\n  Failed files:")
-        for r in err:
-            print(f"  ✗ {r['name']}: {r.get('error')}")
-    print()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Upload course PDFs to Supabase Storage and register in resources table."
+    )
+    parser.add_argument(
+        "--manifest",
+        metavar="JSON",
+        help="Path to JSON manifest of local PDFs (skips Google Drive)",
+    )
+    parser.add_argument(
+        "--folder-id",
+        metavar="ID",
+        help="Google Drive folder ID (skips interactive folder prompt)",
+    )
+    parser.add_argument(
+        "--course",
+        choices=["1", "2"],
+        help="Course number for PDFs (use with --folder-id)",
+    )
+    parser.add_argument(
+        "--topic",
+        choices=sorted(ALLOWED_TOPICS),
+        help="Resource topic for PDFs (use with --folder-id)",
+    )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip upload confirmation prompt",
+    )
+    args = parser.parse_args()
+
+    if "YOUR_PROJECT" in SUPABASE_URL or SUPABASE_SERVICE_KEY == "your_service_role_key":
+        print("\n✗ Please set SUPABASE_URL and SUPABASE_SERVICE_KEY in your .env file.")
+        exit(1)
+
+    print("\nConnecting to Supabase...")
+    sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    print("  ✓ Supabase connected")
+
+    if args.manifest:
+        run_manifest_mode(sb, args.manifest)
+    else:
+        run_drive_mode(
+            sb,
+            folder_id=args.folder_id,
+            course_arg=args.course,
+            topic_arg=args.topic,
+            auto_confirm=args.yes,
+        )
 
 
 if __name__ == "__main__":

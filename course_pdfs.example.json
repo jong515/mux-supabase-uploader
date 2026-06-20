@@ -1,0 +1,38 @@
+[
+  {
+    "local_path": "C:/path/to/workbook.pdf",
+    "bucket": "resources-public",
+    "file_path": "course-1/pdf/workbook.pdf",
+    "title": "Portfolio building workbook",
+    "description": "Step-by-step DSA portfolio guide.",
+    "topic": "dsa-pathways",
+    "is_paid": false,
+    "sort_order": 1,
+    "duration": "24 pages",
+    "category": "course-1"
+  },
+  {
+    "local_path": "C:/path/to/timeline-checklist.pdf",
+    "bucket": "resources-public",
+    "file_path": "course-1/pdf/timeline-checklist.pdf",
+    "title": "Application timeline checklist",
+    "description": "Key deadlines for DSA applications.",
+    "topic": "timelines-deadlines",
+    "is_paid": false,
+    "sort_order": 2,
+    "duration": "8 pages",
+    "category": "course-1"
+  },
+  {
+    "local_path": "C:/path/to/interview-prep.pdf",
+    "bucket": "resources-paid",
+    "file_path": "course-2/pdf/interview-prep.pdf",
+    "title": "Interview preparation guide",
+    "description": "Structured prep for DSA interviews.",
+    "topic": "interview-preparation",
+    "is_paid": true,
+    "sort_order": 1,
+    "duration": "32 pages",
+    "category": "course-2"
+  }
+]

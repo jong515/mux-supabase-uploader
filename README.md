@@ -10,7 +10,7 @@ Run from your own machine. Nothing is deployed or exposed to users.
 | Script | Purpose |
 |---|---|
 | `upload_to_mux.py` | Google Drive → Mux (videos) |
-| `upload_to_supabase.py` | Google Drive → Supabase Storage (PDFs, images) |
+| `upload_to_supabase.py` | Google Drive → Supabase Storage; course PDFs auto-register in `resources` table |
 
 Each script keeps a local sync log so re-runs never double-upload the same file.
 
@@ -59,7 +59,7 @@ Edit `.env`:
 | `MUX_TOKEN_SECRET` | `upload_to_mux.py` | Same as above |
 | `SUPABASE_URL` | `upload_to_supabase.py` | Supabase Dashboard → Settings → API |
 | `SUPABASE_SERVICE_KEY` | `upload_to_supabase.py` | `service_role` key (not `anon`) |
-| `SUPABASE_BUCKET` | `upload_to_supabase.py` | Storage bucket name (default: `resources-public`) |
+| `SUPABASE_BUCKET` | `upload_to_supabase.py` | Optional; used for **image** uploads in Drive mode (default: `resources-public`). Course PDF buckets are set automatically per course. |
 | `GOOGLE_OAUTH_CLIENT_FILE` | Both scripts | Path to OAuth JSON (default: `client_secret.json`) |
 
 Credentials are loaded by `env_config.py` from `.env` at startup. Never commit `.env` — only `.env.example` is tracked in git.
@@ -72,7 +72,7 @@ Credentials are loaded by `env_config.py` from `.env` at startup. Never commit `
 | `client_secret.json` | Google OAuth client (from Cloud Console) |
 | `token_drive.json` | Saved Google sign-in (created on first run) |
 | `mux_sync_log.json` | Tracks uploaded videos |
-| `supabase_sync_log.json` | Tracks uploaded PDFs/images |
+| `supabase_sync_log.json` | Tracks uploaded PDFs/images (bucket, file_path, resource_id for PDFs) |
 
 ---
 
@@ -85,23 +85,67 @@ https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs
                                         This is your folder ID
 ```
 
+**Windows terminal paste:** Ctrl+V often types `^V` instead of pasting. Use **right-click → Paste** or **Shift+Insert**, or pass the folder ID on the command line (see below).
+
 ---
 
 ## Running the Scripts
 
-```bash
+```powershell
 # Upload videos to Mux
 python upload_to_mux.py
 
-# Upload PDFs and images to Supabase
+# Skip folder prompt (avoids paste issues in terminal)
+python upload_to_mux.py --folder-id 1DNWt6NKk0w0tioxWn28bQjI_RN47_PHU -y
+
+# Upload from Google Drive (PDFs + images)
 python upload_to_supabase.py
+
+# Drive upload with folder ID + course metadata on the command line
+python upload_to_supabase.py --folder-id 1DNWt6NKk0w0tioxWn28bQjI_RN47_PHU --course 1 --topic dsa-pathways -y
+
+# Upload local PDFs from a JSON manifest (no Drive)
+python upload_to_supabase.py --manifest course_pdfs.json
 ```
 
-Both scripts will:
-1. Ask you to specify a Drive folder (paste ID directly, or browse subfolders)
-2. Show you a preview of all files found and what's new
-3. Ask for confirmation before uploading anything
-4. Print a summary with IDs/URLs to paste into Supabase
+### Course PDF upload (`upload_to_supabase.py`)
+
+Course PDFs are uploaded to Supabase Storage **and** registered in the `resources` table so they appear in the TTG portal dashboard (`GET /api/v1/resources`).
+
+**Storage layout (do not create new buckets):**
+
+| Course | Bucket | Object key prefix | `is_paid` |
+|---|---|---|---|
+| Course 1 (free) | `resources-public` | `course-1/pdf/` | `false` |
+| Course 2 (paid) | `resources-paid` | `course-2/pdf/` | `true` |
+
+**Allowed `topic` values:**
+
+| Topic | Course |
+|---|---|
+| `dsa-pathways` | Course 1 |
+| `timelines-deadlines` | Course 1 |
+| `interview-preparation` | Course 2 |
+
+**Drive mode** (default):
+
+1. Pick a Google Drive folder
+2. Choose course (1 or 2) and topic — applies to all PDFs in the folder
+3. PDFs upload to the correct bucket/path and upsert a `resources` row (`title`, `type`, `topic`, `bucket`, `file_path`, `is_paid`, etc.)
+4. Images upload to Storage only (no `resources` row); path uses `SUPABASE_BUCKET` from `.env`
+
+Optional companion file `pdfs_manifest.json` — array keyed by Drive `filename` to override `title`, `description`, `sort_order`, `duration`, or `file_path` per file. See field names in `course_pdfs.example.json`.
+
+**Manifest mode** (`--manifest`):
+
+Upload local PDFs from a JSON array. Copy `course_pdfs.example.json` as a template. Each entry needs:
+
+- `local_path`, `bucket`, `file_path`, `title`, `topic`, `is_paid`
+- Optional: `description`, `sort_order`, `duration`, `category`
+
+Upload order: Storage first, then `resources` row. Re-runs are safe — Storage uses upsert; `resources` upserts on `(bucket, file_path)`.
+
+**Summary output:** uploaded / registered / skipped / errors counts plus a per-file log.
 
 ### Mux playback access
 
@@ -120,9 +164,9 @@ Only affects **new** uploads. Existing Mux assets keep the policy they were crea
 | File | Contents |
 |---|---|
 | `mux_sync_log.json` | Drive file ID → Mux asset_id + playback_id |
-| `supabase_sync_log.json` | Drive file ID → Supabase storage URL |
+| `supabase_sync_log.json` | Drive file ID → bucket, file_path, resource_id (PDFs) or storage URL (images) |
 
-Keep these files. They prevent re-uploading the same file on future runs.
+Re-runs upsert Storage and `resources` rows; the sync log is an audit trail.
 
 ---
 
@@ -135,11 +179,7 @@ INSERT INTO videos (mux_asset_id, mux_playback_id, title, entity)
 VALUES ('abc123...', 'xyz789...', 'Introduction to DSA', 'dsa');
 ```
 
-**PDFs / Images (Supabase Storage)** — the script prints the public URL. Insert it:
-```sql
-INSERT INTO resources (public_url, file_type, entity, title)
-VALUES ('https://...supabase.co/storage/...', 'pdf', 'dsa', 'Interview Prep Workbook');
-```
+**Course PDFs (Supabase)** — registered automatically in `resources` by `upload_to_supabase.py`. No manual SQL needed. The portal reads `bucket` + `file_path` from the table to serve PDFs.
 
 ---
 
