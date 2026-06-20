@@ -9,7 +9,7 @@ Run from your own machine. Nothing is deployed or exposed to users.
 
 | Script | Purpose |
 |---|---|
-| `upload_to_mux.py` | Google Drive → Mux (videos) |
+| `upload_to_mux.py` | Google Drive → Mux (videos) + auto-register in `resources` table |
 | `upload_to_supabase.py` | Google Drive → Supabase Storage; course PDFs auto-register in `resources` table |
 
 Each script keeps a local sync log so re-runs never double-upload the same file.
@@ -57,8 +57,8 @@ Edit `.env`:
 |---|---|---|
 | `MUX_TOKEN_ID` | `upload_to_mux.py` | [Mux Dashboard](https://dashboard.mux.com) → Settings → API Keys |
 | `MUX_TOKEN_SECRET` | `upload_to_mux.py` | Same as above |
-| `SUPABASE_URL` | `upload_to_supabase.py` | Supabase Dashboard → Settings → API |
-| `SUPABASE_SERVICE_KEY` | `upload_to_supabase.py` | `service_role` key (not `anon`) |
+| `SUPABASE_URL` | Both upload scripts | Supabase Dashboard → Settings → API |
+| `SUPABASE_SERVICE_KEY` | Both upload scripts | `service_role` key (not `anon`) |
 | `SUPABASE_BUCKET` | `upload_to_supabase.py` | Optional; used for **image** uploads in Drive mode (default: `resources-public`). Course PDF buckets are set automatically per course. |
 | `GOOGLE_OAUTH_CLIENT_FILE` | Both scripts | Path to OAuth JSON (default: `client_secret.json`) |
 
@@ -71,7 +71,7 @@ Credentials are loaded by `env_config.py` from `.env` at startup. Never commit `
 | `.env` | API keys and secrets |
 | `client_secret.json` | Google OAuth client (from Cloud Console) |
 | `token_drive.json` | Saved Google sign-in (created on first run) |
-| `mux_sync_log.json` | Tracks uploaded videos |
+| `mux_sync_log.json` | Tracks uploaded videos (resource_id, mux_asset_id, playback_id) |
 | `supabase_sync_log.json` | Tracks uploaded PDFs/images (bucket, file_path, resource_id for PDFs) |
 
 ---
@@ -95,8 +95,8 @@ https://drive.google.com/drive/folders/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs
 # Upload videos to Mux
 python upload_to_mux.py
 
-# Skip folder prompt (avoids paste issues in terminal)
-python upload_to_mux.py --folder-id 1DNWt6NKk0w0tioxWn28bQjI_RN47_PHU -y
+# Skip folder prompt; register as Course 1 / dsa-pathways
+python upload_to_mux.py --folder-id 1DNWt6NKk0w0tioxWn28bQjI_RN47_PHU --course 1 --topic dsa-pathways -y
 
 # Upload from Google Drive (PDFs + images)
 python upload_to_supabase.py
@@ -147,6 +147,24 @@ Upload order: Storage first, then `resources` row. Re-runs are safe — Storage 
 
 **Summary output:** uploaded / registered / skipped / errors counts plus a per-file log.
 
+### Video upload (`upload_to_mux.py`)
+
+Videos are registered in the Supabase `resources` table **before** upload to Mux so the portal can list them immediately.
+
+**Per-video flow:**
+
+1. Insert/update `resources` row (`type=video`, `title`, `topic`, `is_paid`, `category`, etc.) — no `bucket`/`file_path`
+2. Upload to Mux with `passthrough` set to the resource UUID (links Mux asset to portal row)
+3. After Mux processing, update the row with `mux_asset_id`, `mux_playback_id`, `mux_playback_signed`
+
+**Drive mode:**
+
+1. Pick a Google Drive folder (or `--folder-id`)
+2. Choose course (1 or 2) and topic — same allowed topics as PDFs
+3. Optional `videos_manifest.json` keyed by Drive `filename` to override `title`, `description`, `sort_order`, `duration`, or `topic` per file (see `videos_manifest.example.json`)
+
+Re-runs reuse the same `resource_id` from `mux_sync_log.json` and update Mux IDs (no duplicate portal rows).
+
 ### Mux playback access
 
 By default, `upload_to_mux.py` uploads videos as **public** — anyone with the playback URL can stream them. This is controlled by `PLAYBACK_POLICY` at the top of `upload_to_mux.py`:
@@ -163,7 +181,7 @@ Only affects **new** uploads. Existing Mux assets keep the policy they were crea
 
 | File | Contents |
 |---|---|
-| `mux_sync_log.json` | Drive file ID → Mux asset_id + playback_id |
+| `mux_sync_log.json` | Drive file ID → resource_id, mux_asset_id, playback_id |
 | `supabase_sync_log.json` | Drive file ID → bucket, file_path, resource_id (PDFs) or storage URL (images) |
 
 Re-runs upsert Storage and `resources` rows; the sync log is an audit trail.
@@ -172,12 +190,7 @@ Re-runs upsert Storage and `resources` rows; the sync log is an audit trail.
 
 ## After Uploading
 
-**Videos (Mux)** — the script prints `asset_id` and `playback_id` for each file. Insert them into your videos table, for example:
-
-```sql
-INSERT INTO videos (mux_asset_id, mux_playback_id, title, entity)
-VALUES ('abc123...', 'xyz789...', 'Introduction to DSA', 'dsa');
-```
+**Videos (Mux)** — registered automatically in `resources` by `upload_to_mux.py`. The resource UUID is sent to Mux as `passthrough`. No manual SQL needed.
 
 **Course PDFs (Supabase)** — registered automatically in `resources` by `upload_to_supabase.py`. No manual SQL needed. The portal reads `bucket` + `file_path` from the table to serve PDFs.
 

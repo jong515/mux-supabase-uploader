@@ -27,6 +27,13 @@ from pathlib import Path
 
 from env_config import require_env
 from cli_prompts import prompt_input
+from resources_core import (
+    ALLOWED_TOPICS,
+    pick_course,
+    pick_topic,
+    process_pdf,
+    validate_pdf_definition,
+)
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -52,147 +59,10 @@ PDF_EXTENSIONS = {".pdf"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg"}
 ALL_EXTENSIONS = PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
-ALLOWED_TOPICS = {"dsa-pathways", "timelines-deadlines", "interview-preparation"}
-
-COURSE_1 = {
-    "bucket": "resources-public",
-    "path_prefix": "course-1/pdf/",
-    "is_paid": False,
-    "category": "course-1",
-    "topics": {"dsa-pathways", "timelines-deadlines"},
-}
-
-COURSE_2 = {
-    "bucket": "resources-paid",
-    "path_prefix": "course-2/pdf/",
-    "is_paid": True,
-    "category": "course-2",
-    "topics": {"interview-preparation"},
-}
-
-COURSES = {"1": COURSE_1, "2": COURSE_2}
-
 # Whether image uploads use public URLs in sync log (images only; PDFs use bucket+file_path)
 PUBLIC_UPLOAD = True
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-
-
-# ── Validation & resources core ─────────────────────────────────────────────
-
-
-def _course_for_definition(defn: dict) -> dict | None:
-    bucket = defn.get("bucket")
-    file_path = defn.get("file_path", "")
-    is_paid = defn.get("is_paid")
-
-    if bucket == COURSE_1["bucket"] and file_path.startswith(COURSE_1["path_prefix"]):
-        if is_paid is False or is_paid == False:  # noqa: E712
-            return COURSE_1
-    if bucket == COURSE_2["bucket"] and file_path.startswith(COURSE_2["path_prefix"]):
-        if is_paid is True or is_paid == True:  # noqa: E712
-            return COURSE_2
-    return None
-
-
-def validate_pdf_definition(defn: dict) -> None:
-    required = {"bucket", "file_path", "title", "topic", "is_paid"}
-    missing = required - defn.keys()
-    if missing:
-        raise ValueError(f"Missing required fields: {', '.join(sorted(missing))}")
-
-    topic = defn["topic"]
-    if topic not in ALLOWED_TOPICS:
-        raise ValueError(
-            f"topic must be one of {sorted(ALLOWED_TOPICS)}, got {topic!r}"
-        )
-
-    file_path = defn["file_path"]
-    if file_path.startswith("/"):
-        raise ValueError("file_path must not have a leading slash")
-    if not file_path.lower().endswith(".pdf"):
-        raise ValueError(f"file_path must end with .pdf, got {file_path!r}")
-
-    course = _course_for_definition(defn)
-    if course is None:
-        raise ValueError(
-            "bucket/file_path/is_paid must match Course 1 "
-            "(resources-public, course-1/pdf/, is_paid=false) or Course 2 "
-            "(resources-paid, course-2/pdf/, is_paid=true)"
-        )
-
-    if topic not in course["topics"]:
-        raise ValueError(
-            f"topic {topic!r} is not valid for {course['category']} "
-            f"(allowed: {sorted(course['topics'])})"
-        )
-
-
-def build_resource_row(defn: dict) -> dict:
-    row = {
-        "title": defn["title"],
-        "type": "pdf",
-        "topic": defn["topic"],
-        "bucket": defn["bucket"],
-        "file_path": defn["file_path"],
-        "is_paid": defn["is_paid"],
-    }
-    for key in ("description", "sort_order", "duration", "category"):
-        if key in defn and defn[key] is not None:
-            row[key] = defn[key]
-    return row
-
-
-def upload_pdf_bytes(sb: Client, bucket: str, file_path: str, file_bytes: bytes) -> None:
-    sb.storage.from_(bucket).upload(
-        path=file_path,
-        file=file_bytes,
-        file_options={
-            "content-type": "application/pdf",
-            "upsert": "true",
-        },
-    )
-
-
-def upsert_resource_row(sb: Client, row: dict) -> str:
-    try:
-        result = (
-            sb.table("resources")
-            .upsert(row, on_conflict="bucket,file_path")
-            .execute()
-        )
-        if result.data:
-            return result.data[0]["id"]
-    except Exception:
-        pass
-
-    existing = (
-        sb.table("resources")
-        .select("id")
-        .eq("bucket", row["bucket"])
-        .eq("file_path", row["file_path"])
-        .execute()
-    )
-    if existing.data:
-        resource_id = existing.data[0]["id"]
-        sb.table("resources").update(row).eq("id", resource_id).execute()
-        return resource_id
-
-    result = sb.table("resources").insert(row).execute()
-    return result.data[0]["id"]
-
-
-def process_pdf(sb: Client, file_bytes: bytes, definition: dict) -> dict:
-    validate_pdf_definition(definition)
-    upload_pdf_bytes(sb, definition["bucket"], definition["file_path"], file_bytes)
-    resource_id = upsert_resource_row(sb, build_resource_row(definition))
-    return {
-        "status": "ok",
-        "bucket": definition["bucket"],
-        "file_path": definition["file_path"],
-        "resource_id": resource_id,
-        "title": definition["title"],
-    }
 
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -409,44 +279,6 @@ def pick_folder(service, folder_id: str | None = None) -> tuple[str, str]:
     exit(1)
 
 
-def pick_course(course_arg: str | None = None) -> dict:
-    if course_arg:
-        if course_arg not in COURSES:
-            print(f"\n✗ Invalid --course {course_arg!r}. Use 1 or 2.")
-            exit(1)
-        return COURSES[course_arg]
-
-    print("\nWhich course are these PDFs for?")
-    print("  1. Course 1 (free) — bucket: resources-public, path: course-1/pdf/")
-    print("  2. Course 2 (paid) — bucket: resources-paid, path: course-2/pdf/")
-    choice = prompt_input("\nCourse (1/2): ", show_paste_hint=False)
-    if choice not in COURSES:
-        print("Invalid course.")
-        exit(1)
-    return COURSES[choice]
-
-
-def pick_topic(course: dict, topic_arg: str | None = None) -> str:
-    if topic_arg:
-        if topic_arg not in course["topics"]:
-            print(
-                f"\n✗ topic {topic_arg!r} is not valid for {course['category']}. "
-                f"Allowed: {sorted(course['topics'])}"
-            )
-            exit(1)
-        return topic_arg
-
-    topics = sorted(course["topics"])
-    print(f"\nTopic for {course['category']} PDFs:")
-    for i, t in enumerate(topics, 1):
-        print(f"  {i}. {t}")
-    idx = int(prompt_input("\nSelect topic number: ", show_paste_hint=False)) - 1
-    if idx < 0 or idx >= len(topics):
-        print("Invalid topic.")
-        exit(1)
-    return topics[idx]
-
-
 def load_drive_manifest() -> dict[str, dict]:
     """Optional companion manifest keyed by Drive filename."""
     path = Path(DRIVE_MANIFEST_FILE)
@@ -585,8 +417,8 @@ def run_drive_mode(
 
     image_storage_path = None
     if pdfs:
-        course = pick_course(course_arg)
-        topic = pick_topic(course, topic_arg)
+        course = pick_course(course_arg, content_label="PDFs")
+        topic = pick_topic(course, topic_arg, content_label="PDFs")
         print(f"\n  PDFs → {course['bucket']}/{course['path_prefix']}*")
         print(f"  Topic: {topic}  |  Portal registration: yes")
 
